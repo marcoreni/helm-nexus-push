@@ -20,8 +20,34 @@ Flags:
 EOF
 }
 
-declare USERNAME
-declare PASSWORD
+function parse_yaml {
+   local prefix=$2
+   local s='[[:space:]]*' w='[a-zA-Z0-9_]*' fs=$(echo @|tr @ '\034')
+   sed -ne "s|,$s\]$s\$|]|" \
+        -e ":1;s|^\($s\)\($w\)$s:$s\[$s\(.*\)$s,$s\(.*\)$s\]|\1\2: [\3]\n\1  - \4|;t1" \
+        -e "s|^\($s\)\($w\)$s:$s\[$s\(.*\)$s\]|\1\2:\n\1  - \3|;p" $1 | \
+   sed -ne "s|,$s}$s\$|}|" \
+        -e ":1;s|^\($s\)-$s{$s\(.*\)$s,$s\($w\)$s:$s\(.*\)$s}|\1- {\2}\n\1  \3: \4|;t1" \
+        -e    "s|^\($s\)-$s{$s\(.*\)$s}|\1-\n\1  \2|;p" | \
+   sed -ne "s|^\($s\):|\1|" \
+        -e "s|^\($s\)-$s[\"']\(.*\)[\"']$s\$|\1$fs$fs\2|p" \
+        -e "s|^\($s\)-$s\(.*\)$s\$|\1$fs$fs\2|p" \
+        -e "s|^\($s\)\($w\)$s:$s[\"']\(.*\)[\"']$s\$|\1$fs\2$fs\3|p" \
+        -e "s|^\($s\)\($w\)$s:$s\(.*\)$s\$|\1$fs\2$fs\3|p" | \
+   awk -F$fs '{
+      indent = length($1)/2;
+      vname[indent] = $2;
+      for (i in vname) {if (i > indent) {delete vname[i]; idx[i]=0}}
+      if(length($2)== 0){  vname[indent]= ++idx[indent] };
+      if (length($3) > 0) {
+         vn=""; for (i=0; i<indent; i++) { vn=(vn)(vname[i])("_")}
+         printf("%s%s%s=\"%s\"\n", "'$prefix'",vn, vname[indent], $3);
+      }
+   }'
+}
+
+NEXUS_USERNAME=
+NEXUS_PASSWORD=
 
 declare -a POSITIONAL_ARGS=()
 while [[ $# -gt 0 ]]
@@ -32,21 +58,15 @@ do
             exit 0
             ;;
         -u|--username)
-            if [[ -z "${2:-}" ]]; then
-                echo "Must specify username!"
-                echo "---"
-                usage
-                exit 1
+            if [[ -n "${2:-}" ]]; then
+                shift
+                NEXUS_USERNAME=$1
             fi
-            shift
-            USERNAME=$1
             ;;
         -p|--password)
             if [[ -n "${2:-}" ]]; then
                 shift
-                PASSWORD=$1
-            else
-                PASSWORD=
+                NEXUS_PASSWORD=$1
             fi
             ;;
         *)
@@ -70,7 +90,9 @@ declare REPO=$1
 declare REPO_URL="$(helm repo list | grep "^$REPO" | awk '{print $2}')/"
 declare REPO_AUTH_FILE="$(helm home)/repository/auth.$REPO"
 
-if [[ -z "$REPO_URL" ]]; then
+declare REPOSITORIES_FILE="$(helm home)/repository/repositories.yaml"
+
+if [[ -z "${REPO_URL}" ]]; then
     echo "Invalid repo specified!  Must specify one of these repos..."
     helm repo list
     echo "---"
@@ -84,14 +106,14 @@ declare CHART
 
 case "$2" in
     login)
-        if [[ -z "$USERNAME" ]]; then
-            read -p "Username: " USERNAME
+        if [[ -z "$NEXUS_USERNAME" ]]; then
+            read -p "Username: " NEXUS_USERNAME
         fi
-        if [[ -z "$PASSWORD" ]]; then
-            read -s -p "Password: " PASSWORD
+        if [[ -z "$NEXUS_PASSWORD" ]]; then
+            read -s -p "Password: " NEXUS_PASSWORD
             echo
         fi
-        echo "$USERNAME:$PASSWORD" > "$REPO_AUTH_FILE"
+        echo "$NEXUS_USERNAME:$NEXUS_PASSWORD" > "$REPO_AUTH_FILE"
         ;;
     logout)
         rm -f "$REPO_AUTH_FILE"
@@ -100,19 +122,35 @@ case "$2" in
         CMD=push
         CHART=$2
 
-        if [[ -z "$USERNAME" ]] || [[ -z "$PASSWORD" ]]; then
+        if [[ -z "$NEXUS_USERNAME" ]] || [[ -z "$NEXUS_PASSWORD" ]]; then
             if [[ -f "$REPO_AUTH_FILE" ]]; then
                 echo "Using cached login creds..."
                 AUTH="$(cat $REPO_AUTH_FILE)"
-            else
-                if [[ -z "$USERNAME" ]]; then
-                    read -p "Username: " USERNAME
+
+            elif [[ -f "$REPOSITORIES_FILE" ]]; then
+                echo "Checking helm login creds..."
+                # Parse the repo file
+                eval $(parse_yaml $REPOSITORIES_FILE "nexuscred_")
+                repocount=1
+                
+                while [[ ! -z $(eval echo '${nexuscred_'${repocount}'_name:-}') ]]; do
+                    if [[ $(eval echo '$nexuscred_'${repocount}'_name') == "${REPO}" ]]; then
+                        echo "Found credentials inside helm file"
+                        AUTH="$(eval echo '$nexuscred_'${repocount}'_username'):$(eval echo '$nexuscred_'${repocount}'_password')"
+                        break;
+                    fi
+                    repocount=$[$repocount+1]
+                done
+            fi
+            if [[ -z "${AUTH:-}" ]]; then
+                if [[ -z "$NEXUS_USERNAME" ]]; then
+                    read -p "Username: " NEXUS_USERNAME
                 fi
-                if [[ -z "$PASSWORD" ]]; then
-                    read -s -p "Password: " PASSWORD
+                if [[ -z "$NEXUS_PASSWORD" ]]; then
+                    read -s -p "Password: " NEXUS_PASSWORD
                     echo
                 fi
-                AUTH="$USERNAME:$PASSWORD"
+                AUTH="$NEXUS_USERNAME:$NEXUS_PASSWORD"
             fi
         fi
 
